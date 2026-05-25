@@ -147,10 +147,82 @@ def close_branch(name: str, branch_code: int) -> dict:
 
 ---
 
+## 5. 動工計畫書撰寫 + codex 介面層設計 B vs A vs C（晚間擴增）
+
+§ 3 的「MCP 版 todo_worker 架構設計」其實是兩個獨立決策、晚間寫計畫書時才意識到：
+
+| 層 | 決策 | 5/24 結論 |
+|---|---|---|
+| **worker dispatcher 層** | 觸發時用什麼跑（import vs ephemeral codex vs 重寫 scheduler）| A1 純 Python import |
+| **codex 介面層** | codex 怎麼把排程意圖寫進 db（universal meta-tool vs decorator on each tool）| **B：@schedulable decorator** |
+
+下午到晚間先寫了 [`docs/mcp_todo_worker_開發計畫.md`](../../general-task-bot/docs/mcp_todo_worker_開發計畫.md) 11 章節初版、設計成 universal `schedule_action(tool_module, tool_func, tool_args, run_at)` meta-MCP。
+
+### colombo 觸發設計重評：「大包小」感
+
+colombo 給的關鍵 feedback：
+
+> 「所以寫進這個 todo worker 資料庫的動作、本身也是一個 mcp 嗎? 有點大包小的感覺、原本是直接執行一個 mcp、現在是執行一個鬧鐘 mcp、時間到了要做什麼 mcp 動作的感覺」
+
+抓到 meta-MCP 包另一個 MCP 的 indirection 是真實 cost：
+
+- codex 要 spell 出 module name / func name / args dict、容易拼錯
+- type safety 弱（JSON-encoded args 繞過 function signature）
+- 認知 overhead 高
+
+→ 重新比三個選項：
+
+| 設計 | codex 寫法 | 評價 |
+|---|---|---|
+| A. universal meta-tool | `schedule_action(tool_module="...", tool_func="close_branch", tool_args={...}, run_at=...)` | 大包小、4 必填 abstract 欄 |
+| **B. 寫入 tool 加 `run_at` + `@schedulable` decorator** | `close_branch(name="鑫盛", branch_code=4, run_at="2026-05-31T23:59:59")` | **codex 不必學新 concept、type safety 強、自然語意對映** |
+| C. 每個寫入 tool 出 `_scheduled` 版 | `close_branch_scheduled(name=..., run_at=...)` | 工具集翻倍、重複命名、不推薦 |
+
+### 結論 B：`@schedulable` decorator + 寫入 tool 加 `run_at` 參數
+
+```python
+@mcp.tool()
+@schedulable                         # ← 加一行 decorator
+def close_branch(name: str, branch_code: int) -> dict:
+    # ... 純執行邏輯不變
+
+# codex 用法（沒新 concept、就是 close_branch 多了 optional run_at）：
+close_branch(name="鑫盛", branch_code=4)                      # 立即執行
+close_branch(name="鑫盛", branch_code=4, run_at="2026-...")   # 排程
+```
+
+底層 storage + worker dispatch 都還是 universal、但對 codex 露出的介面是直接的「同一個 tool 兩種模式」、沒中間人。
+
+### Cross-cutting concern pattern 的長期價值
+
+`@schedulable` 是「橫切關注點」的標準解。未來 cwsoft 想加其他橫切機制都可同樣套：
+
+| 假想 decorator | 場景 |
+|---|---|
+| `@auditable` | 寫 audit log（誰、何時、什麼 args、結果）寫進 audit table |
+| `@rate_limited` | 同一 user 一分鐘最多 N 次（防 codex 推理錯誤狂呼） |
+| `@requires_confirmation` | **機制層**強制兩段確認、不靠 prompt（修法博 +6 那種 corner case） |
+
+每個 decorator 寫一次、貼到所有需要的寫入 function 上、不必每個 function 各自實作。**今天的 leverage：建立橫切機制 pattern、未來重複收益**。
+
+### 計畫書最終版 ready
+
+決定 B 之後改了計畫書：
+- § 2 加 2.3「為什麼選 B」+ 2.4「適用範圍只寫入類」
+- § 4 從「schedule_action MCP tool」改成「`@schedulable` decorator + 寫入 tool 改造」+ decorator 完整實作
+- § 6 AGENTS.md 改成「寫入類 tool 加 run_at 註」、tool 清單不必新增
+- § 9 估工同 4 小時、breakdown 微調（decorator + 貼 5 個 tool）
+- § 10 上工 checklist 14 → 15 步
+
+明天 5/25 照 checklist 動工。
+
+---
+
 ## 本輪新增 / 更新檔案
 
 ### general-task-bot
 - `TODO.md`：加 [TODO 2026-05-24] [FEATURE] MCP 版 todo_worker 完整 spec
+- `docs/mcp_todo_worker_開發計畫.md`（新）：11 章節、含 `@schedulable` decorator 完整實作 + AGENTS.md 草稿 + 上工 15 步 checklist、明天 5/25 動工照走
 
 ### cwsoft-aquan-manager
 （無改動）
@@ -180,3 +252,5 @@ def close_branch(name: str, branch_code: int) -> dict:
 - **A1 vs A2 設計選擇的核心**：「**這一步需不需要 AI 推理?**」——排程觸發的「執行」步驟、spec 已 frozen、純工程、不需 AI。AI 中介只該插在「真的需要推理 / 對話 / 判斷」的環節
 - **MCP function 多 entrypoint 性質我之前沒意識到、今天才 internalize**：之前的 broadcast_self_intro.py 我用 `from tools.cwsoft_ai_tools.server import generate_quote` 直接 call、那時就在用這個性質了、但沒抽象成設計原則。今天 colombo 問「MCP 不只可以被 agent 使用、也可以被一般的腳本呼叫 是嗎」、才意識到這是值得明確說的設計優勢。下次跟同事介紹架構時可以拿這個當賣點
 - **跨日工作的時間錯位**：system context 寫的「今天」跟 wall-clock 已差兩天（5/22 vs 5/24）、寫 worklog 時要靠 chat log mtime / notebook 日期 / 對話內容推真實日期、不能 default 信 system date
+- **colombo 直覺觸發架構改善是值得欣賞的協作模式**：我提的 universal `schedule_action` meta-MCP 是「工程上完整、AI 可用」的設計、技術上沒錯。colombo 一句「大包小」直接觸發重新設計、最後 B 是更乾淨的解。**這種「我給技術可行解、colombo 給使用者直覺、合起來找到更好的設計」是 5/16 至今 9 天最有價值的協作模式**——不是我憋出來的、是雙方鏡像出來的
+- **Decorator pattern 的長期 leverage 值得寫進設計筆記**：今天 `@schedulable` 寫好之後、未來 `@auditable` / `@rate_limited` / `@requires_confirmation` 都是同樣模式、每次新加橫切機制成本越來越低、且自動覆蓋所有既有 + 新加的寫入 function。**這是「一次性投資建立 pattern infrastructure、未來重複收益」的具體案例**、明天動工值得記錄在 worklog 強調這個 architectural lesson
